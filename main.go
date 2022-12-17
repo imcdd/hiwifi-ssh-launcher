@@ -5,24 +5,33 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	localTokenUrl = "http://192.168.199.1/local-ssh/api?method=get"
-	routerInfoUrl = "http://192.168.199.1/cgi-bin/turbo/proxy/router_info"
-	launchSshUrl  = "http://192.168.199.1/local-ssh/api?method=valid&data=%s"
+	localTokenUrl = "/local-ssh/api?method=get"
+	routerInfoUrl = "/cgi-bin/turbo/proxy/router_info"
+	localSshUrl   = "/local-ssh/api?method=valid&data=%s"
+)
+
+const (
+	retry       = 10
+	sleepSecond = 10 * time.Second
 )
 
 type LocalTokenResp struct {
 	Data string
 }
 
-type LaunchSshResp struct {
+type LocalSshResp struct {
 	Data string
 }
 
@@ -34,114 +43,240 @@ type RouterInfoData struct {
 	Uuid string
 }
 
+var ErrorSystemBusy = errors.New("系统忙，请稍后重试")
+var address = "192.168.199.1"
+
 func main() {
-	sshLauncher()
-	fmt.Print("按回车退出...")
 	var input string
+	var n int
+	var ip net.IP
+	var err error
+
+	for {
+		fmtPrint("请输入极路由管理IP，然后按回车继续(不输入则默认192.168.199.1): ")
+
+		n, err = fmt.Scanln(&input)
+		if err != nil && err.Error() != "unexpected newline" {
+			fmtPrintFln("输入有误，请重新输入: %v", err)
+			continue
+		}
+
+		if n == 0 {
+			input = address
+		}
+
+		ip = net.ParseIP(input)
+		if ip == nil {
+			fmtPrintFln("输入非合法IP，请重新输入")
+			continue
+		}
+
+		address = ip.String()
+		fmtPrintFln("极路由IP为: %s", address)
+		break
+	}
+
+	launchSsh()
+
+	fmtPrint("按回车退出...")
 	_, _ = fmt.Scanln(&input)
 }
 
-func sshLauncher() {
-	ltr := LocalTokenResp{}
-	rir := RouterInfoResp{}
-	osr := LaunchSshResp{}
+func launchSsh() {
+	var localToken string
+	var uuid string
+	var cloudToken string
+	var port string
 	var err error
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i <= retry; i++ {
 		if i != 0 {
-			fmt.Printf("第%d次重试\n\n", i)
+			time.Sleep(sleepSecond)
+			fmtPrintFln("----------------------------------------------------------------")
+			fmtPrintFln("第%d次重试", i)
 		}
 
-		fmt.Println("开始获取local_token")
-		err = httpGet(localTokenUrl, &ltr)
+		fmtPrintFln("开始获取UUID")
+		uuid, err = getUUID()
 		if err != nil {
-			fmt.Printf("获取local_token出错: \n%v\n\n", err)
+			fmtPrintFln("获取uuid出错: %v", err)
 			continue
 		}
-		fmt.Printf("获取local_token成功:\n%s\n\n", ltr.Data)
+		fmtPrintFln("获取uuid成功: %s ", uuid)
 
-		fmt.Println("开始获取uuid")
-		err = httpGet(routerInfoUrl, &rir)
+		fmtPrintFln("开始获取local_token")
+		localToken, err = getLocalToken()
 		if err != nil {
-			fmt.Printf("获取uuid出错: \n%v\n\n", err)
+			fmtPrintFln("获取local_token出错: %v", err)
 			continue
 		}
-		fmt.Printf("获取uuid成功:\n%s\n\n", rir.Data.Uuid)
+		fmtPrintFln("获取local_token成功: %s", localToken)
 
-		fmt.Println("开始计算cloud_token")
-
-		cloudToken := ""
-		cloudToken, err = getCloudToken(rir.Data.Uuid, ltr.Data)
+		fmtPrintFln("开始生成cloud_token")
+		cloudToken, err = getCloudToken(uuid, localToken)
 		if err != nil {
-			fmt.Printf("获取cloud_token出错: \n%v\n\n", err)
+			fmtPrintFln("生成cloud_token出错: %v", err)
 			continue
 		}
-		fmt.Printf("获取local_token成功:\n%s\n\n", cloudToken)
+		fmtPrintFln("生成cloud_token成功: %s", cloudToken)
 
-		err = httpGet(fmt.Sprintf(launchSshUrl, cloudToken), &osr)
+		fmtPrintFln("开始获取local_ssh")
+		port, err = getLocalSsh(cloudToken)
 		if err != nil {
-			fmt.Printf("开启ssh端口出错: %v\n\n", err)
+			fmtPrintFln("获取local_ssh出错: %v", err)
 			continue
 		}
-		if strings.Contains(osr.Data, "ssh port is") {
-			suc := strings.ReplaceAll(osr.Data, "Success: ssh port is ", "ssh开启成功, 端口号为:")
-			fmt.Println(suc)
-		} else {
-			fmt.Println(ltr.Data)
-			fmt.Println(rir.Data.Uuid)
-			fmt.Println(cloudToken)
-		}
-		break
+		fmtPrintFln("获取local_ssh成功，端口号: %s，有效期5分钟，请及时更改为永久ssh", port)
+		return
 	}
+	fmtPrintFln("获取local_ssh出错，请检查IP是否有误，UUID，LocalToken是否正常获取")
+	fmtPrintFln("极路由IP为: %s", address)
+	fmtPrintFln("UUID为: %s", uuid)
+	fmtPrintFln("LocalToken为: %s", localToken)
+	fmtPrintFln("CloudToken为: %s", cloudToken)
 }
 
-func getCloudToken(uuid, localToken string) (string, error) {
-	key := sha1Sum(uuid)
-	msg := tokenToMsg(localToken)
-	res := hmacSha1(msg, key)
-	fmt.Println("cloud_token: ", res)
-	return "", nil
-}
+func getLocalSsh(cloudToken string) (port string, err error) {
+	var osr *LocalSshResp
+	osr = &LocalSshResp{}
 
-func tokenToMsg(cipher string) []byte {
-	decodedLocalToken, err := base64.StdEncoding.DecodeString(cipher)
+	err = httpGet(generateUrl(localSshUrl, cloudToken), osr)
 	if err != nil {
-		fmt.Println("Err StdEncoding:", err.Error())
+		return
 	}
-	splitToken := strings.Split(string(decodedLocalToken), ",")
-	i, err := strconv.Atoi(splitToken[2])
+
+	if !strings.Contains(osr.Data, "Success: ssh port is ") {
+		err = errors.New(fmt.Sprint("Unknown error:", osr.Data))
+	}
+
+	port = strings.ReplaceAll(osr.Data, "Success: ssh port is ", "")
+	return
+}
+
+func getUUID() (uuid string, err error) {
+	var rir *RouterInfoResp
+	rir = &RouterInfoResp{}
+
+	err = httpGet(generateUrl(routerInfoUrl), rir)
 	if err != nil {
-		fmt.Println("String->Int: Err", err)
+		return
 	}
-	i += 1
-	splitToken[2] = strconv.Itoa(i)
-	str := strings.Join(splitToken[:3], ",")
-	return []byte(str)
+
+	uuid = rir.Data.Uuid
+	return
 }
 
-func sha1Sum(uuid string) []byte {
-	result := sha1.Sum([]byte(uuid))
-	return result[:]
+func getLocalToken() (localToken string, err error) {
+	var ltr *LocalTokenResp
+	ltr = &LocalTokenResp{}
+
+	err = httpGet(generateUrl(localTokenUrl), ltr)
+	if err != nil {
+		return
+	}
+
+	localToken = ltr.Data
+	return
 }
 
-func hmacSha1(msg, key []byte) string {
-	mac := hmac.New(sha1.New, key)
+func getCloudToken(uuid, localToken string) (cloudToken string, err error) {
+	var key [sha1.Size]byte
+	var msg []byte
+	var expectedMAC []byte
+
+	msg, err = tokenToMsg(localToken)
+	if err != nil {
+		return
+	}
+
+	key = sha1Sum(uuid)
+	expectedMAC = hmacSha1Sum(msg, key[:])
+	cloudToken = base64.StdEncoding.EncodeToString(expectedMAC)
+
+	return
+}
+
+func httpGet(url string, data interface{}) (err error) {
+	var resp *http.Response
+	var body []byte
+
+	url = strings.ReplaceAll(url, "+", "%2B")
+
+	resp, err = http.Get(url)
+	if err != nil {
+		return
+	}
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	if strings.Contains(string(body), "系统忙，请稍后重试") {
+		err = ErrorSystemBusy
+		return
+	}
+
+	err = json.Unmarshal(body, data)
+	if err != nil {
+		fmtPrintFln("json Unmarshal error: %s", string(body))
+		return
+	}
+
+	return
+}
+
+func generateUrl(api string, a ...any) (url string) {
+	api = fmt.Sprintf(api, a...)
+	url = "http://" + address + api
+	return
+}
+
+func tokenToMsg(localToken string) (msg []byte, err error) {
+	var decodedLocalToken []byte
+	var splitToken []string
+	var timestamp int
+	var msgStr string
+
+	decodedLocalToken, err = base64.StdEncoding.DecodeString(localToken)
+	if err != nil {
+		return
+	}
+	splitToken = strings.Split(string(decodedLocalToken), ",")
+
+	timestamp, err = strconv.Atoi(splitToken[2])
+	if err != nil {
+		return
+	}
+
+	timestamp += 1
+	splitToken[2] = strconv.Itoa(timestamp)
+	msgStr = strings.Join(splitToken[:3], ",")
+	msg = []byte(msgStr)
+
+	return
+}
+
+func sha1Sum(uuid string) (checksum [sha1.Size]byte) {
+	var data []byte
+	data = []byte(uuid)
+	checksum = sha1.Sum(data)
+	return
+}
+
+func hmacSha1Sum(msg, key []byte) (expectedMAC []byte) {
+	var mac hash.Hash
+	mac = hmac.New(sha1.New, key)
 	mac.Write(msg)
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	expectedMAC = mac.Sum(nil)
+	return
 }
 
-func httpGet(url string, v interface{}) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(body, v)
-	if err != nil {
-		return err
-	}
-	return nil
+func fmtPrintFln(format string, a ...any) {
+	fmt.Printf(format, a...)
+	fmt.Println()
+}
+
+func fmtPrint(a ...any) {
+	fmt.Print(a...)
 }
